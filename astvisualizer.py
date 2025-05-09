@@ -1,192 +1,346 @@
 import ast
+import os
+import argparse
+from collections import defaultdict
 from graphviz import Digraph
 
-# Parse the server.py file into an AST
-with open('server.py', 'r', encoding='utf-8') as f:
-    code_text = f.read()
-tree = ast.parse(code_text)
+def parse_target_calls(targets: list[str]) -> list[tuple[str | None, str]]:
+    pairs = []
+    for t in targets:
+        parts = t.split('.', 1)
+        if len(parts) == 1:
+            pairs.append((None, parts[0]))
+        else:
+            pairs.append((parts[0], parts[1]))
+    return pairs
 
-# Helper to detect if an AST node (or any of its children) uses the Flask 'request' (external input)
-def is_external_input(node):
-    if node is None:
+def is_route_decorator(dec: ast.AST) -> bool:
+    if not isinstance(dec, ast.Call):
         return False
+    func = dec.func
+    return (isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.attr == "route")
+
+def is_cli_decorator(dec: ast.AST) -> bool:
+    if not isinstance(dec, ast.Call):
+        return False
+    func = dec.func
+    return (isinstance(func, ast.Attribute)
+            and func.attr == "command"
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "cli"
+            and isinstance(func.value.value, ast.Name))
+
+def is_socketio_decorator(dec: ast.AST) -> bool:
+    if not isinstance(dec, ast.Call):
+        return False
+    func = dec.func
+    return (isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "socketio"
+            and func.attr in ("on", "event"))
+
+def uses_request(node: ast.AST) -> bool:
     return any(isinstance(n, ast.Name) and n.id == 'request' for n in ast.walk(node))
 
-# Find all yaml.load call nodes and classify them as external or internal
-yaml_load_calls = []
-class FindYamlLoad(ast.NodeVisitor):
-    def __init__(self):
-        self.current_func = None  # track enclosing function name
-    def visit_FunctionDef(self, node):
-        prev = self.current_func
-        self.current_func = node.name
-        self.generic_visit(node)
-        self.current_func = prev
-    def visit_ClassDef(self, node):
-        self.generic_visit(node)  # just traverse into class body
-    def visit_Call(self, node):
-        # Check if it's a call to yaml.load
-        if isinstance(node.func, ast.Attribute) and node.func.attr == 'load':
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'yaml':
-                yaml_load_calls.append((node, self.current_func))
-        self.generic_visit(node)
+def collect_functions(tree: ast.Module) -> dict[str, dict]:
+    func_info = {}
+    class FuncVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.cls = None
+        def visit_ClassDef(self, node):
+            prev_cls = self.cls
+            self.cls = node.name
+            self.generic_visit(node)
+            self.cls = prev_cls
+        def visit_FunctionDef(self, node):
+            name = f"{self.cls}.{node.name}" if self.cls else node.name
+            func_info[name] = {
+                'line': node.lineno,
+                'is_route': any(is_route_decorator(d) for d in node.decorator_list),
+                'is_cli': any(is_cli_decorator(d) for d in node.decorator_list),
+                'is_socketio': any(is_socketio_decorator(d) for d in node.decorator_list),
+                'uses_req': uses_request(node),
+                'is_restful': False,
+            }
+            self.generic_visit(node)
 
-FindYamlLoad().visit(tree)
+    FuncVisitor().visit(tree)
+    return func_info
 
-# Determine external/internal for each yaml.load call
-external_calls = set()
-internal_calls = set()
-for call_node, func_name in yaml_load_calls:
-    # If the call’s argument originates from request or the call is in _external_load, mark external
-    first_arg = call_node.args[0] if call_node.args else None
-    if func_name == '_external_load' or is_external_input(first_arg):
-        external_calls.add(id(call_node))
-    else:
-        internal_calls.add(id(call_node))
+def invert_graph(call_graph: dict[str, set[str]]) -> dict[str, set[str]]:
+    inv = defaultdict(set)
+    for caller, callees in call_graph.items():
+        for callee in callees:
+            inv[callee].add(caller)
+    return inv
 
-# Prepare Graphviz Digraph
-dot = Digraph(name="AST", comment="AST of server.py")
-dot.attr('graph', bgcolor='white', rankdir='LR')
-dot.attr('node', style='filled', fontcolor='black', color='black', fillcolor='white')
-dot.attr('edge', fontcolor='black')
+def collect_related(target_calls, callers_map):
+    related = set()
+    for fn, *_ in target_calls:
+        related.add(fn)
+        stack = [fn]
+        while stack:
+            cur = stack.pop()
+            for parent in callers_map.get(cur, []):
+                if parent not in related:
+                    related.add(parent)
+                    stack.append(parent)
+    return related
 
-node_counter = 0
-node_ids = {}  # map ast node id to graph node name
+def sanitize_id(name: str) -> str:
+    return name.replace('.', '_').replace(' ', '_').replace('/', '_')
 
-# Recursive function to add nodes and edges to the graph
-def add_node(node, parent_id=None, field_name=None):
-    global node_counter
-    nid = node_ids.get(id(node))
-    if nid is None:
-        # Assign a new graph node ID
-        nid = f"node{node_counter}"
-        node_ids[id(node)] = nid
-        node_counter += 1
-        # Create a label for this AST node
-        label_parts = []  
-        node_type = type(node).__name__
-        # Base label is the AST node type
-        # (We will append additional info for certain types below)
-        label = node_type
+def visualize_call_flow(file_paths, base_dir, output_path, targets):
+    global_func_info = {}
+    call_graph = defaultdict(set)
+    target_calls = []
 
-        # Include key information based on node type
-        if isinstance(node, ast.FunctionDef):
-            label = f"FunctionDef: name={node.name}, args={len(node.args.args)}"
-        elif isinstance(node, ast.ClassDef):
-            label = f"ClassDef: name={node.name}"
-        elif isinstance(node, ast.Import):
-            mods = [alias.name for alias in node.names]
-            label = "Import: " + ", ".join(mods)
-        elif isinstance(node, ast.ImportFrom):
-            mods = [alias.name for alias in node.names]
-            label = f"ImportFrom: {node.module}, names=" + ", ".join(mods)
-        elif isinstance(node, ast.Assign):
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                label = f"Assign: {node.targets[0].id} = ..."
-            else:
-                label = "Assign"
-        elif isinstance(node, ast.Return):
-            label = "Return"
-        elif isinstance(node, ast.Call):
-            # Identify the function being called for label
-            func = node.func
-            if isinstance(func, ast.Name):
-                func_name = func.id
-            elif isinstance(func, ast.Attribute):
-                if isinstance(func.value, ast.Name):
-                    func_name = f"{func.value.id}.{func.attr}"
-                elif isinstance(func.value, ast.Attribute) and isinstance(func.value.value, ast.Name):
-                    # handle attribute chain (e.g., obj.method.attr)
-                    func_name = f"{func.value.value.id}.{func.value.attr}.{func.attr}"
+    # HTTP 메서드 이름 집합 (Flask-RESTful)
+    restful_http_methods = {"get", "post", "put", "delete", "patch", "head", "options"}
+
+    # 함수 정의 수집
+    for fp in file_paths:
+        try:
+            code = open(fp, encoding='utf-8').read()
+            tree = ast.parse(code)
+        except Exception:
+            continue
+        rel_path = os.path.relpath(fp, base_dir)
+        prefix = rel_path.replace(os.sep, '.')[:-3] if rel_path.endswith('.py') else rel_path.replace(os.sep, '.')
+        if prefix == '':
+            prefix = os.path.splitext(os.path.basename(fp))[0]
+        funcs = collect_functions(tree)
+        for name, info in funcs.items():
+            full_name = f"{prefix}.{name}" if prefix else name
+            info['file'] = rel_path
+            global_func_info[full_name] = info
+
+    # 호출 그래프 구축 및 진입점 등록 탐지
+    for fp in file_paths:
+        try:
+            code = open(fp, encoding='utf-8').read()
+            tree = ast.parse(code)
+        except Exception:
+            continue
+        rel_path = os.path.relpath(fp, base_dir)
+        prefix = rel_path.replace(os.sep, '.')[:-3] if rel_path.endswith('.py') else rel_path.replace(os.sep, '.')
+        if prefix == '':
+            prefix = os.path.splitext(os.path.basename(fp))[0]
+
+        class CallVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.cur_func = None
+                self.cls = None
+            def visit_ClassDef(self, node):
+                prev_cls = self.cls
+                self.cls = node.name
+                self.generic_visit(node)
+                self.cls = prev_cls
+            def visit_FunctionDef(self, node):
+                prev = self.cur_func
+                func_name = f"{self.cls}.{node.name}" if self.cls else node.name
+                self.cur_func = f"{prefix}.{func_name}" if prefix else func_name
+                self.generic_visit(node)
+                self.cur_func = prev
+
+            def visit_Call(self, node):
+                # 진입점 등록 호출 탐지
+                if isinstance(node.func, ast.Attribute):
+                    attr = node.func.attr
+                    # SocketIO on_event
+                    if attr == "on_event" and getattr(node.func.value, 'id', None) == "socketio":
+                        handler = (node.args[1] if len(node.args)>=2 else
+                                   next((kw.value for kw in node.keywords if kw.arg in ("handler", "callback")), None))
+                        if isinstance(handler, (ast.Name, ast.Attribute)):
+                            hname = handler.id if isinstance(handler, ast.Name) else handler.attr
+                            for fn in global_func_info:
+                                if fn == hname or fn.endswith(f".{hname}"):
+                                    global_func_info[fn]['is_socketio'] = True
+                                    break
+                    # add_url_rule
+                    elif attr == "add_url_rule":
+                        view_node = next((kw.value for kw in node.keywords if kw.arg=="view_func"), None)
+                        if view_node is None:
+                            # view_func 추출
+                            if len(node.args)>=3:
+                                view_node = node.args[2]
+                            elif len(node.args)==2:
+                                view_node = node.args[1]
+                        if view_node:
+                            # 클래스 기반 뷰
+                            if isinstance(view_node, ast.Call) and getattr(view_node.func, 'attr', None)=="as_view":
+                                cls_node = view_node.func.value
+                                cls_name = getattr(cls_node, 'id', getattr(cls_node, 'attr', None))
+                                if cls_name:
+                                    for fn in global_func_info:
+                                        if f".{cls_name}." in fn:
+                                            method = fn.split('.')[-1]
+                                            if method in restful_http_methods:
+                                                global_func_info[fn]['is_route'] = True
+                            else:
+                                name = (view_node.id if isinstance(view_node, ast.Name)
+                                        else view_node.attr if isinstance(view_node, ast.Attribute)
+                                        else None)
+                                if name:
+                                    for fn in global_func_info:
+                                        if fn == name or fn.endswith(f".{name}"):
+                                            global_func_info[fn]['is_route'] = True
+                                            break
+                    elif attr == "add_resource":
+                        cls_node = node.args[0] if node.args else None
+                        if isinstance(cls_node, (ast.Name, ast.Attribute)):
+                            cls_name = cls_node.id if isinstance(cls_node, ast.Name) else cls_node.attr
+                            for fn in global_func_info:
+                                if f".{cls_name}." in fn:
+                                    method = fn.split('.')[-1]
+                                    if method in restful_http_methods:
+                                        global_func_info[fn]['is_restful'] = True
+                    # SocketIO on 
+                    elif attr == "on" and getattr(node.func.value, 'id', None)=="socketio":
+                        handler = (node.args[1] if len(node.args)>=2 else
+                                   next((kw.value for kw in node.keywords if kw.arg in ("handler","callback")), None))
+                        if isinstance(handler, (ast.Name, ast.Attribute)):
+                            hname = handler.id if isinstance(handler, ast.Name) else handler.attr
+                            for fn in global_func_info:
+                                if fn == hname or fn.endswith(f".{hname}"):
+                                    global_func_info[fn]['is_socketio'] = True
+                                    break
+
+                # 호출 그래프용 일반 호출 간선 추가
+                if self.cur_func is None:
+                    self.generic_visit(node)
+                    return
+
+                if isinstance(node.func, ast.Name):
+                    callee = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    callee = node.func.attr
+                    if callee in {"add_url_rule","add_resource","on_event","on"}:
+                        callee = None
                 else:
-                    func_name = func.attr
-            else:
-                func_name = node_type  # fallback to node type if unusual callable
-            label = f"Call: {func_name} (args={len(node.args)})"
-            # Mark external/internal on yaml.load calls
-            if id(node) in external_calls:
-                label += " [external]"
-                dot.node(nid, label=label, fillcolor="lightcoral")  # red background
-            elif id(node) in internal_calls:
-                label += " [internal]"
-                dot.node(nid, label=label, fillcolor="lightblue")  # blue background
-        elif isinstance(node, ast.Attribute):
-            label = f"Attribute: .{node.attr}"
-        elif isinstance(node, ast.Name):
-            ctx = type(node.ctx).__name__  # Load/Store
-            label = f"Name: {node.id} ({ctx})"
-        elif isinstance(node, ast.Constant):
-            val = node.value
-            if isinstance(val, str):
-                # For long strings, truncate in label
-                s = val.replace("\n", "\\n")
-                if len(s) > 20:
-                    s = s[:17] + "..."
-                label = f"Constant: \"{s}\""
-            else:
-                label = f"Constant: {val}"
-        elif isinstance(node, ast.arg):
-            label = f"arg: {node.arg}"
-        elif isinstance(node, ast.For):
-            label = "For"
-        elif isinstance(node, ast.If):
-            label = "If"
-        elif isinstance(node, ast.While):
-            label = "While"
-        elif isinstance(node, ast.Try):
-            label = "Try"
-        elif isinstance(node, ast.ExceptHandler):
-            label = "ExceptHandler"
-        elif isinstance(node, ast.List):
-            label = f"List (elts={len(node.elts)})"
-        elif isinstance(node, ast.Tuple):
-            label = f"Tuple (elts={len(node.elts)})"
-        elif isinstance(node, ast.Dict):
-            # number of key-value pairs
-            count = len(node.keys) if node.keys else 0
-            label = f"Dict (pairs={count})"
-        elif isinstance(node, ast.Set):
-            label = f"Set (elts={len(node.elts)})"
-        elif isinstance(node, ast.ListComp):
-            label = "ListComp"
-        elif isinstance(node, ast.GeneratorExp):
-            label = "GeneratorExp"
-        elif isinstance(node, ast.comprehension):
-            label = "comprehension"
-        elif isinstance(node, ast.With):
-            label = "With"
-        elif isinstance(node, ast.withitem):
-            label = "withitem"
-        # (Other node types will just use the base type name)
+                    callee = None
 
-        # Add the node to the graph (if not already added above for call coloring)
-        if not (isinstance(node, ast.Call) and (id(node) in external_calls or id(node) in internal_calls)):
-            dot.node(nid, label=label)
+                if callee:
+                    for fn in global_func_info:
+                        if fn == self.cur_func:
+                            continue
+                        if fn == callee or fn.endswith(f".{callee}"):
+                            call_graph[self.cur_func].add(fn)
+                            break
+
+                ok = False
+                for mod, func in targets:
+                    if mod:
+                        if (isinstance(node.func, ast.Attribute)
+                                and isinstance(node.func.value, ast.Name)
+                                and node.func.value.id==mod and node.func.attr==func):
+                            ok = True
+                            break
+                    else:
+                        if isinstance(node.func, ast.Name) and node.func.id==func:
+                            ok = True
+                            break
+                if ok:
+                    cont = self.cur_func or prefix or '<module>'
+                    a0 = ast.get_source_segment(code, node.args[0]) if node.args else ''
+                    kws = [f"{kw.arg}={ast.get_source_segment(code,kw.value)}" for kw in node.keywords]
+                    target_calls.append((cont, node, a0, kws, rel_path))
+
+                self.generic_visit(node)
+
+        CallVisitor().visit(tree)
+
+    # 외부 함수 집합 구성
+    external_funcs = {
+        fn for fn, info in global_func_info.items()
+        if info.get('is_route') or info.get('is_cli')
+        or info.get('is_socketio') or info.get('is_restful')
+    }
+
+    stack = list(external_funcs)
+    
+    while stack:
+        cur = stack.pop()
+        for callee in call_graph.get(cur, []):
+            if callee not in external_funcs:
+                external_funcs.add(callee)
+                stack.append(callee)
+
+    # 시각화
+    rel_map = invert_graph(call_graph)
+    related = collect_related(target_calls, rel_map)
+    labels = [f"{(m + '.' if m else '')}{f}" for m, f in targets]
+    dot = Digraph(comment="Call flow for " + ", ".join(labels))
+    dot.attr(rankdir='LR', bgcolor='white')
+    dot.attr('node', style='filled')
+    dot.attr('edge', fontcolor='black')
+
+    # 시작 함수 노드 정의
+    for fn in sorted(related):
+        info = global_func_info.get(fn, {})
+        lbl = f"{fn}\n(file: {info.get('file','?')}, line: {info.get('line','?')})"
+        tags = []
+        if info.get('is_route'):      tags.append('route')
+        if info.get('is_restful'):    tags.append('restful')
+        if info.get('is_cli'):        tags.append('cli')
+        if info.get('is_socketio'):   tags.append('socketio')
+        if info.get('uses_req'):      tags.append('uses_request')
+        if tags:
+            lbl += "\n[" + ",".join(tags) + "]"
+        fill = 'lightgoldenrod' if (info.get('is_route') or info.get('is_cli')
+                                    or info.get('is_socketio') or info.get('is_restful')) else 'white'
+        dot.node(sanitize_id(fn), label=lbl, fillcolor=fill)
+
+    # 타겟 함수 노드 정의
+    for cont, node, a0, kws, rel_path in target_calls:
+        ln = node.lineno
+        api = (f"{node.func.value.id}.{node.func.attr}"
+               if isinstance(node.func, ast.Attribute) else node.func.id)
+        lbl = f"{api}\n(file: {rel_path}, line: {ln})"
+        if a0: lbl += f"\narg0: {a0}"
+        if kws: lbl += "\n" + ",".join(kws)
+        ext = cont in external_funcs
+        lbl += f"\n[{'external' if ext else 'internal'}]"
+        cid = sanitize_id(f"call_{cont}_{ln}")
+        dot.node(cid, label=lbl, shape='oval',
+                 fillcolor=('lightcoral' if ext else 'lightblue'))
+        dot.edge(sanitize_id(cont), cid, label=f"calls (line {ln})")
+
+    # 노드간 간선 연결
+    for caller, callees in call_graph.items():
+        if caller in related:
+            for callee in callees:
+                if callee in related:
+                    dot.edge(sanitize_id(caller), sanitize_id(callee), label='calls')
+
+    dot.format = 'png'
+    dot.render(output_path, cleanup=True)
+    print(f"[+] Graph saved as {output_path}.png")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('path', help='Path to the Python file/folder to analyze')
+    parser.add_argument('-o', '--output', default='callflow', help='Output filename prefix')
+    parser.add_argument('-t', '--target', action='append', default=[], help='Target function(s) to highlight (e.g., yaml.load)')
+    args = parser.parse_args()
+
+    target_list = args.target or ['yaml.load']
+    targets = parse_target_calls(target_list)
+
+    input_path = args.path
+
+    if os.path.isdir(input_path):
+        base = input_path.rstrip(os.sep)
+        files = []
+        for root, _, filenames in os.walk(input_path):
+            for f in filenames:
+                if f.endswith('.py'):
+                    files.append(os.path.join(root, f))
     else:
-        # Node already visited; use existing nid
-        nid = node_ids[id(node)]
+        base = os.path.dirname(input_path) or '.'
+        files = [input_path]
 
-    # Add an edge from parent to this node (with field name or index if available)
-    if parent_id:
-        edge_label = ""
-        if field_name is not None:
-            edge_label = str(field_name)
-        dot.edge(parent_id, nid, label=edge_label)
-
-    # Recurse into children fields
-    for field, value in ast.iter_fields(node):
-        if isinstance(value, ast.AST):
-            add_node(value, nid, field)
-        elif isinstance(value, list):
-            for idx, elem in enumerate(value):
-                if isinstance(elem, ast.AST):
-                    # Label list edges with index
-                    add_node(elem, nid, f"{field}[{idx}]")
-
-# Build the graph starting from the root of the AST
-add_node(tree)
-
-# Render the AST graph to file (e.g., PNG image)
-dot.format = 'png'
-dot.render('server_ast_graph', cleanup=True)
-print("AST visualization saved as server_ast_graph.png")
+    visualize_call_flow(files, base, args.output, targets)
