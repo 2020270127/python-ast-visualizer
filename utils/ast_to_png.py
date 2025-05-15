@@ -166,7 +166,8 @@ def visualize_call_flow(
         f"{(module + '.') if module else ''}{func}"
         for module, func in target_call_list
     ]
-    graph = Digraph(comment="Call flow for " + ", ".join(target_labels))
+    # graph = Digraph(comment="Call flow for " + ", ".join(target_labels)) # 타겟이 많을 경우 dot 프로그램 터짐 이거때문에 몇시간을 날린줄 알아?
+    graph = Digraph()
     graph.attr(rankdir='LR', bgcolor='white')
     graph.attr('node', style='filled')
     graph.attr('edge', fontcolor='black')
